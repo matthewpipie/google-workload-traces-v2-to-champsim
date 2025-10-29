@@ -87,7 +87,7 @@ const char* branch_type_names[] = {
 };
 
 // Convert from DynamoRIO branch type to our internal branch type
-BranchType getBranchType(int instr_type) {
+BranchType getBranchType(trace_type_t instr_type) {
     switch (instr_type) {
         case TRACE_TYPE_INSTR_DIRECT_JUMP:    return BRANCH_DIRECT_JUMP;
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:    return BRANCH_INDIRECT_JUMP;
@@ -102,46 +102,21 @@ BranchType getBranchType(int instr_type) {
 }
 
 // Global per-branch-type overflow counters.
-std::array<std::atomic<int>, 8> branch_dst_overflow_counts = {0,0,0,0,0,0,0,0};
-std::array<std::atomic<int>, 8> branch_src_overflow_counts = {0,0,0,0,0,0,0,0};
+std::array<std::atomic<uint64_t>, 8> branch_dst_overflow_counts = {0,0,0,0,0,0,0,0};
+std::array<std::atomic<uint64_t>, 8> branch_src_overflow_counts = {0,0,0,0,0,0,0,0};
 
 static std::mutex print_mutex;
 
 // -----------------------------------------------------------------------------
 // Per-thread statistics structure.
 struct SimStats {
-    size_t total_insts = 0;
-    size_t branch_count = 0;
-    std::array<size_t, 8> branch_type_counts = {0,0,0,0,0,0,0,0}; // Indexed by BranchType 0..7.
-};
-
-// -----------------------------------------------------------------------------
-// disasm_info_t: Holds disassembly information.
-class disasm_info_t : public decode_info_base_t {
-public:
-    std::string disasm_;
-    // Debug fields could be enabled if desired.
-    instr_t *instr = nullptr;
-private:
-    std::string set_decode_info_derived(void *dcontext, const _memref_instr_t &memref_instr,
-                                          instr_t *instr, app_pc decode_pc) {
-        this->instr = instr;
-        return "";
-    }
+    uint64_t total_insts = 0;
+    uint64_t branch_count = 0;
+    std::array<uint64_t, 8> branch_type_counts = {0,0,0,0,0,0,0,0}; // Indexed by BranchType 0..7.
 };
 
 #define TESTANY(mask, var) (((mask) & (var)) != 0)
 
-// -----------------------------------------------------------------------------
-// Helper: Initialize decode_cache and set disassembly flags.
-std::unique_ptr<decode_cache_t<disasm_info_t>>
-init_decode_cache_and_set_flags(void* dcontext, scheduler_t::stream_t* stream) {
-    auto decode_cache_ = std::make_unique<decode_cache_t<disasm_info_t>>(
-        dcontext, true, true);
-    auto filetype_ = stream->get_filetype();
-    std::string error_string_ = decode_cache_->init(static_cast<offline_file_type_t>(filetype_));
-    return decode_cache_;
-}
 
 // -----------------------------------------------------------------------------
 // Helper functions for register assignment.
@@ -226,7 +201,7 @@ bool addDstRegistersForBranch(input_instr &instr, int &dstCount, const std::vect
 // -----------------------------------------------------------------------------
 // Helper: Consolidated branch-specific register assignments.
 // Uses specialized branch helpers (without offset).
-bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCount, int branchType, bool verbose) {
+bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCount, trace_type_t branchType, bool verbose) {
     BranchType bType = getBranchType(branchType);
     switch (branchType) {
         case TRACE_TYPE_INSTR_DIRECT_JUMP:
@@ -286,7 +261,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t instr, input
     uint used_flag = instr_get_arith_flags(&instr, DR_QUERY_DEFAULT);
 
     for (int i = 0; i < instr_num_srcs(&instr); i++) {
-        opnd_t opnd = instr_get_src(&instr, i);
+        opnd_t opnd = instr_get_src(&instr, (uint)i); // assert >= 0
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
         if (verbose) {
             std::cout << "src register: " << reg << std::endl;
@@ -296,7 +271,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t instr, input
     }
 
     for (int i = 0; i < instr_num_dsts(&instr); i++) {
-        opnd_t opnd = instr_get_dst(&instr, i);
+        opnd_t opnd = instr_get_dst(&instr, (uint)i);
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
         if (verbose) {
             std::cout << "dst register: " << reg << std::endl;
@@ -376,8 +351,9 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
 
     auto start_time = std::chrono::high_resolution_clock::now();
     std::string filename = output_file_path;
-    if (!filename.empty() && filename.back() != '/' && filename.back() != '\\')
+    if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
         filename += "/";
+    }
 
 	int width = 4; // number of digits you want, e.g. 0001, 0002, ...
 	std::ostringstream oss;
@@ -395,8 +371,6 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
         std::cout << "Thread " << thread_id << " processing filetype " 
                   << stream->get_filetype() << "\n";
     }
-    
-    auto decode_cache_ = init_decode_cache_and_set_flags(dcontext, stream);
     
     memref_t record;
     scheduler_t::stream_status_t status = stream->next_record(record);
@@ -428,7 +402,7 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
 			  << "TODO"
 			  << " Elapsed time: "
                           << elapsed_seconds << " seconds" << ", MI/s: "
-                          << (local_count / 1000000.0) / elapsed_seconds << "\n";
+                          << ((double)(local_count) / 1000000.0) / elapsed_seconds << "\n";
 		print_mutex.unlock();
             }
             stats.total_insts++;
@@ -563,12 +537,12 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     }
     disassemble_set_syntax(flags);
 
-    all_stats.resize(num_cores);
+    all_stats.resize((unsigned)num_cores);
     std::vector<std::thread> threads;
-    threads.reserve(num_cores);
+    threads.reserve((unsigned)num_cores);
     for (int i = 0; i < num_cores; ++i) {
         threads.emplace_back([dcontext, i, &scheduler, verbose, &all_stats, &output_file_path, &output_file_name]() {
-            simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[i],
+            simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[(unsigned int)i],
                           output_file_path, output_file_name);
         });
     }
@@ -607,7 +581,7 @@ int main(int argc, char *argv[]) {
     std::string output_file_name = "bravo";
     bool verbose = true;
     size_t target_count = 0;
-    int num_cores = 8; // Default number of cores
+    int num_cores = 0;
 
     int opt;
     int option_index = 0;
@@ -665,13 +639,13 @@ int main(int argc, char *argv[]) {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 
-    int total_insts = 0;
-    int total_branches = 0;
-    std::array<int, 8> total_branch_types = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint64_t total_insts = 0;
+    uint64_t total_branches = 0;
+    std::array<uint64_t, 8> total_branch_types = {0, 0, 0, 0, 0, 0, 0, 0};
     for (const auto &s : thread_stats) {
         total_insts += s.total_insts;
         total_branches += s.branch_count;
-        for (int i = 0; i < 8; i++) {
+        for (size_t i = 0; i < 8; i++) {
             total_branch_types[i] += s.branch_type_counts[i];
         }
     }
@@ -681,34 +655,34 @@ int main(int argc, char *argv[]) {
     std::cout << "Total branch instructions:    " << total_branches << "\n";
     
     std::cout << "\nBranch Types for each core:\n";
-    for (int i = 0; i < thread_stats.size(); i++) {
+    for (size_t i = 0; i < thread_stats.size(); i++) {
         std::cout << "Thread " << i << ":\n";
-        for (int j = 0; j < 8; j++) {
+        for (size_t j = 0; j < 8; j++) {
             std::cout << branch_type_names[j] << ": " << thread_stats[i].branch_type_counts[j] << "\n";
         }
     }
 
     std::cout << "\nFaults:\n";
-    for (int i = 0; i < FAULT_MAX; ++i) {
+    for (size_t i = 0; i < FAULT_MAX; ++i) {
         std::cout << fault_names[i] << ": " << failure_counts[i] << "\n";
     }
     
     std::cout << "\nBranch Destination Register Overflows:\n";
-    for (int i = 0; i < 8; i++) {
+    for (size_t i = 0; i < 8; i++) {
         std::cout << branch_type_names[i] << ": " << branch_dst_overflow_counts[i] << "\n";
     }
     
     std::cout << "\nBranch Source Register Overflows:\n";
-    for (int i = 0; i < 8; i++) {
+    for (size_t i = 0; i < 8; i++) {
         std::cout << branch_type_names[i] << ": " << branch_src_overflow_counts[i] << "\n";
     }
     
-    for (int i = 0; i < thread_stats.size(); i++) {
+    for (size_t i = 0; i < thread_stats.size(); i++) {
         std::cout << "Thread " << i << " processed " << thread_stats[i].total_insts << " instructions\n";
     }
     
     std::cout << "\nTime taken: " << elapsed.count() << " seconds\n";
-    std::cout << "Seconds per million instructions: " << elapsed.count() / (total_insts * 1.0 / 1e6) << "\n";
+    std::cout << "Seconds per million instructions: " << elapsed.count() / ((double)(total_insts) / 1e6) << "\n";
 
     return 0;
 }
