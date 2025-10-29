@@ -25,25 +25,12 @@ add_library(main_obj OBJECT src/main.cpp)
 target_compile_options(main_obj PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror
 )
-# target_include_directories(main_obj PRIVATE
-#     ${DYNAMORIO_BUILD}/clients/include
-#     ${DYNAMORIO_ROOT}/clients/drcachesim
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/common
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/reader
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/tracer
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/scheduler
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/tools
-#     ${DYNAMORIO_ROOT}/clients/drcachesim/tools/common
-#     ${DYNAMORIO_ROOT}/core/ir
-#     ${DYNAMORIO_ROOT}/include
-#     ${DYNAMORIO_ROOT}/tools/include
-# )
 
 # Then add executable with the object file and other sources
 add_executable(converter
     $<TARGET_OBJECTS:main_obj>
-    ${dynamorio_dir}/tools/common/decode_cache.cpp
-    ${dynamorio_dir}/tracer/raw2trace_shared.cpp
+    # ${dynamorio_dir}/tools/common/decode_cache.cpp
+    # ${dynamorio_dir}/tracer/raw2trace_shared.cpp
 )
 
 set_target_properties(converter PROPERTIES
@@ -60,6 +47,7 @@ configure_DynamoRIO_standalone(converter)
 target_include_directories(main_obj SYSTEM PRIVATE
     ${PROJECT_SOURCE_DIR}
     "${dynamorio_base}/build/clients/include"
+    # "${dynamorio_base}/build/clients/include/drmemtrace"
     ${dynamorio_dir}/simulator
     ${dynamorio_dir}/common
     ${dynamorio_dir}/reader

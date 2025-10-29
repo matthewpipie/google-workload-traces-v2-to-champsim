@@ -15,3 +15,11 @@ There is no need to build ChampSim, as we just need its header files.
 
 ## Running
 
+# TODO
+* type safe rand
+* fix up rand
+* fix up entire schedule function
+* create per-thread args
+* turn quiet into verbose
+* download google trace instructions
+* usage instructions

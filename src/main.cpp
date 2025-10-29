@@ -1,11 +1,16 @@
-// Written originally by Kan Zhu
-// Modified by Matthew Giordano
+// Written by Kan Zhu, modified by Matthew Giordano
 
-#include <dr_api.h>
+// DynamoRIO imports
+#include "dr_api.h"
 #include "drmemtrace/scheduler.h"
-#include "decode_cache.h"
+// #include "decode_cache.h"
 #include "view.h"
+#include "instr_api.h"
 
+// ChampSim imports
+#include "trace_instruction.h"
+
+// std imports
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -16,19 +21,18 @@
 #undef NDEBUG
 #include <cassert>
 #include <string>
-#include <trace_instruction.h>
 #include <zlib.h>    // For gzopen, gzwrite, gzclose
 #include <cstdlib>   // For std::to_string, atoi, rand()
 #include <atomic>    // For std::atomic
 #include <getopt.h>  // For getopt_long
-#include "instr_api.h"
 #include <sys/resource.h>
-
 #include <chrono>
 #include <array>
 #include <vector>
-
 #include <unordered_map>
+
+// shrink integer
+#include "safe_num_cast.hpp"
 
 using namespace dynamorio::drmemtrace;
 using namespace champsim;
@@ -59,7 +63,7 @@ const char *fault_names[FAULT_MAX + 1] = {
 };
 
 // Thread-safe fault counters.
-std::atomic<int> failure_counts[FAULT_MAX + 1] = {0};
+std::atomic<uint64_t> failure_counts[FAULT_MAX + 1] = {0};
 
 // -----------------------------------------------------------------------------
 // Branch Types and Names (for statistics)
@@ -72,7 +76,8 @@ enum BranchType {
     BRANCH_TAKEN_JUMP, // only used on conditional taken direct jumps
     BRANCH_UNTAKEN_JUMP, // only used on conditional untaken direct jumps
     BRANCH_CONDITIONAL_JUMP, // depricated, should always be 0 in practice
-    BRANCH_INVALID  // For non-branch or unknown types.
+    BRANCH_INVALID,  // For non-branch or unknown types.
+    BRANCH_MAX
 };
 
 const char* branch_type_names[] = {
@@ -89,7 +94,7 @@ const char* branch_type_names[] = {
 // Convert from DynamoRIO branch type to our internal branch type
 BranchType getBranchType(trace_type_t instr_type) {
     switch (instr_type) {
-        case TRACE_TYPE_INSTR_DIRECT_JUMP:    return BRANCH_DIRECT_JUMP;
+        case TRACE_TYPE_INSTR_DIRECT_JUMP:      return BRANCH_DIRECT_JUMP;
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:    return BRANCH_INDIRECT_JUMP;
         case TRACE_TYPE_INSTR_DIRECT_CALL:      return BRANCH_DIRECT_CALL;
         case TRACE_TYPE_INSTR_INDIRECT_CALL:    return BRANCH_INDIRECT_CALL;
@@ -97,13 +102,13 @@ BranchType getBranchType(trace_type_t instr_type) {
         case TRACE_TYPE_INSTR_TAKEN_JUMP:       return BRANCH_TAKEN_JUMP;
         case TRACE_TYPE_INSTR_UNTAKEN_JUMP:     return BRANCH_UNTAKEN_JUMP;
         case TRACE_TYPE_INSTR_CONDITIONAL_JUMP: return BRANCH_CONDITIONAL_JUMP;
-        default:                              return BRANCH_INVALID;
+        default:                                return BRANCH_INVALID;
     }
 }
 
 // Global per-branch-type overflow counters.
-std::array<std::atomic<uint64_t>, 8> branch_dst_overflow_counts = {0,0,0,0,0,0,0,0};
-std::array<std::atomic<uint64_t>, 8> branch_src_overflow_counts = {0,0,0,0,0,0,0,0};
+std::array<std::atomic<uint64_t>, BRANCH_MAX> branch_dst_overflow_counts = {0,0,0,0,0,0,0,0,0};
+std::array<std::atomic<uint64_t>, BRANCH_MAX> branch_src_overflow_counts = {0,0,0,0,0,0,0,0,0};
 
 static std::mutex print_mutex;
 
@@ -112,7 +117,7 @@ static std::mutex print_mutex;
 struct SimStats {
     uint64_t total_insts = 0;
     uint64_t branch_count = 0;
-    std::array<uint64_t, 8> branch_type_counts = {0,0,0,0,0,0,0,0}; // Indexed by BranchType 0..7.
+    std::array<uint64_t, BRANCH_MAX> branch_type_counts = {0,0,0,0,0,0,0,0,0}; // Indexed by BranchType 0..7.
 };
 
 #define TESTANY(mask, var) (((mask) & (var)) != 0)
@@ -123,76 +128,76 @@ struct SimStats {
 // For non-branch instructions, we add an offset of 100 to registers;
 // for branch instructions, we use the register value as-is.
 
-bool addSrcRegister(input_instr &instr, int &srcCount, uint8_t reg, bool verbose) {
+bool addSrcRegister(input_instr &champsim_instr, int &srcCount, uint8_t reg, bool verbose) {
     if (srcCount >= 4) {
         if (verbose) std::cerr << "Too many source registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_SRC_REGISTERS]++;
         return false;
     }
-    instr.source_registers[srcCount++] = reg + 100;
+    champsim_instr.source_registers[srcCount++] = reg + 100;
     return true;
 }
 
-bool addDstRegister(input_instr &instr, int &dstCount, uint8_t reg, bool verbose) {
+bool addDstRegister(input_instr &champsim_instr, int &dstCount, uint8_t reg, bool verbose) {
     if (dstCount >= 2) {
         if (verbose) std::cerr << "Too many destination registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_DST_REGISTERS]++;
         return false;
     }
-    instr.destination_registers[dstCount++] = reg + 100;
+    champsim_instr.destination_registers[dstCount++] = reg + 100;
     return true;
 }
 
 // Branch register helpers: no offset added.
-bool addSrcRegisterForBranch(input_instr &instr, int &srcCount, uint8_t reg, bool verbose, BranchType bType) {
+bool addSrcRegisterForBranch(input_instr &champsim_instr, int &srcCount, uint8_t reg, bool verbose, BranchType bType) {
     if (srcCount >= 4) {
         if (verbose) std::cerr << "Too many source registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_src_overflow_counts[bType]++;
         return false;
     }
-    instr.source_registers[srcCount++] = reg;
+    champsim_instr.source_registers[srcCount++] = reg;
     return true;
 }
 
-bool addDstRegisterForBranch(input_instr &instr, int &dstCount, uint8_t reg, bool verbose, BranchType bType) {
+bool addDstRegisterForBranch(input_instr &champsim_instr, int &dstCount, uint8_t reg, bool verbose, BranchType bType) {
     if (dstCount >= 2) {
         if (verbose) std::cerr << "Too many destination registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_dst_overflow_counts[bType]++;
         return false;
     }
-    instr.destination_registers[dstCount++] = reg;
+    champsim_instr.destination_registers[dstCount++] = reg;
     return true;
 }
 
-bool addSrcRegisters(input_instr &instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose) {
+bool addSrcRegisters(input_instr &champsim_instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose) {
     for (uint8_t reg : regs) {
-        if (!addSrcRegister(instr, srcCount, reg, verbose))
+        if (!addSrcRegister(champsim_instr, srcCount, reg, verbose))
             return false;
     }
     return true;
 }
 
-bool addDstRegisters(input_instr &instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose) {
+bool addDstRegisters(input_instr &champsim_instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose) {
     for (uint8_t reg : regs) {
-        if (!addDstRegister(instr, dstCount, reg, verbose))
+        if (!addDstRegister(champsim_instr, dstCount, reg, verbose))
             return false;
     }
     return true;
 }
 
-bool addSrcRegistersForBranch(input_instr &instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
+bool addSrcRegistersForBranch(input_instr &champsim_instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
     for (uint8_t reg : regs) {
-        if (!addSrcRegisterForBranch(instr, srcCount, reg, verbose, bType))
+        if (!addSrcRegisterForBranch(champsim_instr, srcCount, reg, verbose, bType))
             return false;
     }
     return true;
 }
 
-bool addDstRegistersForBranch(input_instr &instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
+bool addDstRegistersForBranch(input_instr &champsim_instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
     for (uint8_t reg : regs) {
-        if (!addDstRegisterForBranch(instr, dstCount, reg, verbose, bType))
+        if (!addDstRegisterForBranch(champsim_instr, dstCount, reg, verbose, bType))
             return false;
     }
     return true;
@@ -201,7 +206,7 @@ bool addDstRegistersForBranch(input_instr &instr, int &dstCount, const std::vect
 // -----------------------------------------------------------------------------
 // Helper: Consolidated branch-specific register assignments.
 // Uses specialized branch helpers (without offset).
-bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCount, trace_type_t branchType, bool verbose) {
+bool assignBranchRegisters(input_instr &champsim_input_instr, int &srcCount, int &dstCount, trace_type_t branchType, bool verbose) {
     BranchType bType = getBranchType(branchType);
     switch (branchType) {
         case TRACE_TYPE_INSTR_DIRECT_JUMP:
@@ -210,41 +215,41 @@ bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCoun
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect jump" << std::endl;
-                if (!addSrcRegisterForBranch(input_instr, srcCount, rand() % 16 + 50, verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(rand() % 16 + 50), verbose, bType))
                     return false;
             }
             break;
         case TRACE_TYPE_INSTR_CONDITIONAL_JUMP:
         case TRACE_TYPE_INSTR_TAKEN_JUMP:
         case TRACE_TYPE_INSTR_UNTAKEN_JUMP:
-            if (!addSrcRegisterForBranch(input_instr, srcCount, REG_INSTRUCTION_POINTER, verbose, bType))
+            if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_INSTRUCTION_POINTER, verbose, bType))
                 return false;
             break;
         case TRACE_TYPE_INSTR_DIRECT_CALL:
             srcCount = 0;
-            if (!addSrcRegistersForBranch(input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addSrcRegistersForBranch(champsim_input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             dstCount = 0;
-            if (!addDstRegistersForBranch(input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             break;
         case TRACE_TYPE_INSTR_INDIRECT_CALL:
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect call" << std::endl;
-                if (!addSrcRegisterForBranch(input_instr, srcCount, rand() % 16 + 50, verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(rand() % 16 + 50), verbose, bType))
                     return false;
             }
-            if (!addSrcRegistersForBranch(input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addSrcRegistersForBranch(champsim_input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             dstCount = 0;
-            if (!addDstRegistersForBranch(input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             break;
         case TRACE_TYPE_INSTR_RETURN:
-            if (!addSrcRegisterForBranch(input_instr, srcCount, REG_STACK_POINTER, verbose, bType))
+            if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_STACK_POINTER, verbose, bType))
                 return false;
             dstCount = 0;
-            if (!addDstRegistersForBranch(input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             break;
         default:
@@ -255,63 +260,64 @@ bool assignBranchRegisters(input_instr &input_instr, int &srcCount, int &dstCoun
 
 // -----------------------------------------------------------------------------
 // update_inst_registers: Update input_instr registers for the given instruction.
-void update_inst_registers(void *dcontext, memref_t record, instr_t instr, input_instr &input_instr, bool verbose = false) {
+void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, input_instr &champsim_input_instr, bool verbose = false) {
+    (void)(dcontext); // "use" it
     int srcCount = 0;
     int dstCount = 0;
-    uint used_flag = instr_get_arith_flags(&instr, DR_QUERY_DEFAULT);
+    uint used_flag = instr_get_arith_flags(&dr_instr, DR_QUERY_DEFAULT);
 
-    for (int i = 0; i < instr_num_srcs(&instr); i++) {
-        opnd_t opnd = instr_get_src(&instr, (uint)i); // assert >= 0
+    for (int i = 0; i < instr_num_srcs(&dr_instr); i++) {
+        opnd_t opnd = instr_get_src(&dr_instr, safe_num_cast<uint>(i));
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
         if (verbose) {
             std::cout << "src register: " << reg << std::endl;
         }
-        if (!addSrcRegister(input_instr, srcCount, reg, verbose))
+        if (!addSrcRegister(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(reg), verbose))
             return;
     }
 
-    for (int i = 0; i < instr_num_dsts(&instr); i++) {
-        opnd_t opnd = instr_get_dst(&instr, (uint)i);
+    for (int i = 0; i < instr_num_dsts(&dr_instr); i++) {
+        opnd_t opnd = instr_get_dst(&dr_instr, safe_num_cast<uint>(i));
         reg_id_t reg = opnd_get_reg_used(opnd, 0);
         if (verbose) {
             std::cout << "dst register: " << reg << std::endl;
         }
-        if (!addDstRegister(input_instr, dstCount, reg, verbose))
+        if (!addDstRegister(champsim_input_instr, dstCount, safe_num_cast<uint8_t>(reg), verbose))
             return;
     }
 
     if (TESTANY(EFLAGS_WRITE_ARITH, used_flag)) {
         if (verbose) std::cout << "EFLAGS is written" << std::endl;
-        if (!addDstRegisterForBranch(input_instr, dstCount, REG_FLAGS, verbose, BRANCH_INVALID))
+        if (!addDstRegisterForBranch(champsim_input_instr, dstCount, REG_FLAGS, verbose, BRANCH_INVALID))
             return;
     }
     if (TESTANY(EFLAGS_READ_ARITH, used_flag)) {
         if (verbose) std::cout << "EFLAGS is read" << std::endl;
-        if (!addSrcRegisterForBranch(input_instr, srcCount, REG_FLAGS, verbose, BRANCH_INVALID))
+        if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_FLAGS, verbose, BRANCH_INVALID))
             return;
     }
 
-    if (record.instr.type == TRACE_TYPE_INSTR)
+    if (record.instr.type == TRACE_TYPE_INSTR) {
         return;
-
-    {
+    } else {
         BranchType bType = getBranchType(record.instr.type);
         dstCount = 0;
-        if (!addDstRegisterForBranch(input_instr, dstCount, REG_INSTRUCTION_POINTER, verbose, bType))
+        if (!addDstRegisterForBranch(champsim_input_instr, dstCount, REG_INSTRUCTION_POINTER, verbose, bType)) {
             return;
+        }
     }
 
-    if (!assignBranchRegisters(input_instr, srcCount, dstCount, record.instr.type, verbose))
+    if (!assignBranchRegisters(champsim_input_instr, srcCount, dstCount, record.instr.type, verbose))
         return;
 }
 
 // -----------------------------------------------------------------------------
 // update_branch_info: Update branch flags and fault counts.
-void update_branch_info(memref_t record, input_instr &input_instr) {
+void update_branch_info(memref_t record, input_instr &champsim_input_instr) {
     switch (record.instr.type) {
         case TRACE_TYPE_INSTR:
-            input_instr.is_branch = false;
-            input_instr.branch_taken = false;
+            champsim_input_instr.is_branch = false;
+            champsim_input_instr.branch_taken = false;
             break;
         case TRACE_TYPE_INSTR_DIRECT_JUMP:
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:
@@ -319,22 +325,22 @@ void update_branch_info(memref_t record, input_instr &input_instr) {
         case TRACE_TYPE_INSTR_INDIRECT_CALL:
         case TRACE_TYPE_INSTR_RETURN:
         case TRACE_TYPE_INSTR_TAKEN_JUMP:
-            input_instr.is_branch = true;
-            input_instr.branch_taken = true;
+            champsim_input_instr.is_branch = true;
+            champsim_input_instr.branch_taken = true;
             break;
         case TRACE_TYPE_INSTR_UNTAKEN_JUMP:
-            input_instr.is_branch = true;
-            input_instr.branch_taken = false;
+            champsim_input_instr.is_branch = true;
+            champsim_input_instr.branch_taken = false;
             break;
         case TRACE_TYPE_INSTR_CONDITIONAL_JUMP:
-            input_instr.is_branch = true;
-            input_instr.branch_taken = false;
+            champsim_input_instr.is_branch = true;
+            champsim_input_instr.branch_taken = false;
             std::cerr << "unknown conditional jump" << std::endl;
             failure_counts[FAULT_UNKNOWN_CONDITIONAL_BRANCH_TAKEN]++;
             break;
         default:
-            input_instr.is_branch = false;
-            input_instr.branch_taken = false;
+            champsim_input_instr.is_branch = false;
+            champsim_input_instr.branch_taken = false;
             std::cerr << "Unknown instruction type: " << record.instr.type << std::endl;
             failure_counts[FAULT_UNKNOWN_INST]++;
             break;
@@ -355,9 +361,9 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
         filename += "/";
     }
 
-	int width = 4; // number of digits you want, e.g. 0001, 0002, ...
-	std::ostringstream oss;
-	oss << std::setw(width) << std::setfill('0') << thread_id;
+        int width = 4; // number of digits you want, e.g. 0001, 0002, ...
+        std::ostringstream oss;
+        oss << std::setw(width) << std::setfill('0') << thread_id;
 
     filename += output_file_name + "_" + oss.str() + ".champsim.gz";
     
@@ -389,21 +395,21 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
             //size_t count = g_global_inst_count.fetch_add(1) + 1;
             //if (g_target_inst_count != 0 && count >= g_target_inst_count)
                 //break;
-	    local_count++;
+            local_count++;
             if (g_target_inst_count != 0 && local_count >= g_target_inst_count)
                 break;
             //if (count % 100000 == 0) {
             if (local_count % 1000000 == 0) {
                 auto elapsed_time = std::chrono::high_resolution_clock::now() - start_time;
                 double elapsed_seconds = std::chrono::duration<double>(elapsed_time).count();
-		print_mutex.lock();
+                print_mutex.lock();
                 std::cout << "Processed " << local_count << " instructions, " << " Core " <<  thread_id << " cache size: " 
                           //<< decode_cache_->decode_cache_.size()
-			  << "TODO"
-			  << " Elapsed time: "
+                          << "TODO"
+                          << " Elapsed time: "
                           << elapsed_seconds << " seconds" << ", MI/s: "
                           << ((double)(local_count) / 1000000.0) / elapsed_seconds << "\n";
-		print_mutex.unlock();
+                print_mutex.unlock();
             }
             stats.total_insts++;
             // if (decode_cache_->decode_cache_.size() > 200000) {
@@ -419,14 +425,14 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
                 // std::cout << disasm_info->disasm_;
             }
 
-	    int64_t cur_tid = record.instr.tid;
-	    if (last_tid != cur_tid) {
-		    // core id, instr count, thread id
-		print_mutex.lock();
-		std::cout << "***" << thread_id << "," << local_count << "," << cur_tid << "\n";
-		print_mutex.unlock();
-		last_tid = cur_tid;
-	    }
+            int64_t cur_tid = record.instr.tid;
+            if (last_tid != cur_tid) {
+                    // core id, instr count, thread id
+                print_mutex.lock();
+                std::cout << "***" << thread_id << "," << local_count << "," << cur_tid << "\n";
+                print_mutex.unlock();
+                last_tid = cur_tid;
+            }
 
             size_t pc = record.instr.addr;
             auto it = pc_instr_map.find(pc);
@@ -441,7 +447,8 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
 
                 instr_init(dcontext, &instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
-                app_pc nextpc = decode_from_copy(dcontext, record.instr.encoding, decode_pc, &instr);
+                app_pc _nextpc = decode_from_copy(dcontext, record.instr.encoding, decode_pc, &instr);
+                (void)(_nextpc); // use it
                 pc_instr_map[pc] = instr;
             }
 
@@ -508,8 +515,8 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
                                                scheduler_t::SCHEDULER_DEFAULTS);
     scheduler_t::scheduler_status_t status = scheduler.init(sched_inputs, num_cores, std::move(sched_ops));
     if (status != scheduler_t::STATUS_SUCCESS) {
-	    std::cout << "error: " << status << std::endl;
-	    std::cout << "estring: " << scheduler.get_error_string() << std::endl;
+            std::cout << "error: " << status << std::endl;
+            std::cout << "estring: " << scheduler.get_error_string() << std::endl;
         assert(false);
     }
     
@@ -517,7 +524,7 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     auto filetype_ = scheduler.get_stream(0)->get_filetype();
     
     if (TESTANY(OFFLINE_FILE_TYPE_ARCH_ALL & ~OFFLINE_FILE_TYPE_ARCH_REGDEPS, filetype_) &&
-        !TESTANY(build_target_arch_type(), filetype_)) {
+        !TESTANY(build_target_arch_type(), safe_num_cast<int>(filetype_))) {
         std::string error_string_ = std::string("Architecture mismatch: trace recorded on ") +
                                     trace_arch_string(static_cast<offline_file_type_t>(filetype_)) +
                                     " but tool built for " +
@@ -537,17 +544,18 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     }
     disassemble_set_syntax(flags);
 
-    all_stats.resize((unsigned)num_cores);
+    all_stats.resize(safe_num_cast<unsigned>(num_cores));
     std::vector<std::thread> threads;
-    threads.reserve((unsigned)num_cores);
+    threads.reserve(safe_num_cast<unsigned>(num_cores));
     for (int i = 0; i < num_cores; ++i) {
         threads.emplace_back([dcontext, i, &scheduler, verbose, &all_stats, &output_file_path, &output_file_name]() {
-            simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[(unsigned int)i],
+            simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[safe_num_cast<unsigned>(i)],
                           output_file_path, output_file_name);
         });
     }
-    for (std::thread &thread : threads)
+    for (std::thread &thread : threads) {
         thread.join();
+    }
 }
 
 
@@ -556,7 +564,7 @@ void setrlim() {
     
     if (getrlimit(RLIMIT_NOFILE, &lim) != 0) {
         perror("getrlimit");
-	exit(1);
+        exit(1);
     }
 
     std::cout << "Current limits:\n";
@@ -567,7 +575,7 @@ void setrlim() {
 
     if (setrlimit(RLIMIT_NOFILE, &lim) != 0) {
         perror("setrlimit");
-	exit(1);
+        exit(1);
     }
 
     std::cout << "RLIMIT_NOFILE set to " << lim.rlim_cur << ".\n";
