@@ -31,16 +31,11 @@
 #include <vector>
 #include <unordered_map>
 
-// shrink integer
+// my headers
 #include "safe_num_cast.hpp"
 
 using namespace dynamorio::drmemtrace;
 using namespace champsim;
-
-// -----------------------------------------------------------------------------
-// Global atomic counters for instruction processing.
-std::atomic<size_t> g_global_inst_count(0); // number of instructions processed, across all threads
-std::atomic<size_t> g_target_inst_count(0); // number of instructions to stop at, not changed once threads start
 
 // -----------------------------------------------------------------------------
 // Fault Types and Names (for debugging/statistics)
@@ -347,34 +342,44 @@ void update_branch_info(memref_t record, input_instr &champsim_input_instr) {
     }
 }
 
+struct thread_args {
+    void* dcontext; // DynamoRIO context, not thread safe, to be removed
+    scheduler_t::stream_t *stream; // Instruction stream
+    const int thread_id;
+    const bool verbose;
+    SimStats &stats;
+    const std::string &output_file_without_suffix;
+    const uint64_t instruction_cap_global; // If nonzero, stop as soon as all threads combined have processed this many instructions
+    std::atomic<size_t> &g_global_inst_count; // number of instructions processed, across all threads, if above is nonzero
+    const uint64_t instruction_cap_local; // If nonzero, stop this thread once this number of instructions have been reached
+};
+
 // -----------------------------------------------------------------------------
 // simulate_core: Processes records from a given stream.
-void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id, bool verbose,
-                   SimStats &stats, const std::string &output_file_path,
-                   const std::string &output_file_name) {
+void simulate_core(thread_args &args) {
 
     std::unordered_map<size_t, instr_t> pc_instr_map;
 
     auto start_time = std::chrono::high_resolution_clock::now();
-    std::string filename = output_file_path;
-    if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
-        filename += "/";
-    }
 
-        int width = 4; // number of digits you want, e.g. 0001, 0002, ...
-        std::ostringstream oss;
-        oss << std::setw(width) << std::setfill('0') << thread_id;
+    int output_file_zero_width = 4; // number of digits you want, e.g. 0001, 0002, ...
+    std::ostringstream oss;
+    oss << std::setw(output_file_zero_width) << std::setfill('0') << args.thread_id;
 
-    filename += output_file_name + "_" + oss.str() + ".champsim.gz";
+    std::string filename = args.output_file_without_suffix + "_" + oss.str() + ".champsim.gz";
     
     gzFile gz_out = gzopen(filename.c_str(), "w");
     if (!gz_out) {
         std::cerr << "Failed to open gz file " << filename << "\n";
         return;
     }
+
+    // aliased because we use it so much
+    scheduler_t::stream_t *stream = args.stream;
+    SimStats &stats = args.stats;
     
-    if (verbose) {
-        std::cout << "Thread " << thread_id << " processing filetype " 
+    if (args.verbose) {
+        std::cout << "Thread " << args.thread_id << " processing filetype " 
                   << stream->get_filetype() << "\n";
     }
     
@@ -396,14 +401,15 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
             //if (g_target_inst_count != 0 && count >= g_target_inst_count)
                 //break;
             local_count++;
-            if (g_target_inst_count != 0 && local_count >= g_target_inst_count)
+            if (args.instruction_cap_local != 0 && local_count >= args.instruction_cap_local) {
                 break;
+            }
             //if (count % 100000 == 0) {
             if (local_count % 1000000 == 0) {
                 auto elapsed_time = std::chrono::high_resolution_clock::now() - start_time;
                 double elapsed_seconds = std::chrono::duration<double>(elapsed_time).count();
                 print_mutex.lock();
-                std::cout << "Processed " << local_count << " instructions, " << " Core " <<  thread_id << " cache size: " 
+                std::cout << "Processed " << local_count << " instructions, " << " Core " <<  args.thread_id << " cache size: " 
                           //<< decode_cache_->decode_cache_.size()
                           << "TODO"
                           << " Elapsed time: "
@@ -417,7 +423,7 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
             //     decode_cache_->decode_cache_.clear();
             // }
 
-            if (verbose) {
+            if (args.verbose) {
                 std::cout << std::left << std::setw(12) << "ifetch" << std::right
                           << std::setw(2) << record.instr.size << " byte(s) @ 0x" << std::hex
                           << std::setfill('0') << std::setw(sizeof(void *) * 2) << record.instr.addr
@@ -429,7 +435,7 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
             if (last_tid != cur_tid) {
                     // core id, instr count, thread id
                 print_mutex.lock();
-                std::cout << "***" << thread_id << "," << local_count << "," << cur_tid << "\n";
+                std::cout << "***" << args.thread_id << "," << local_count << "," << cur_tid << "\n";
                 print_mutex.unlock();
                 last_tid = cur_tid;
             }
@@ -445,15 +451,15 @@ void simulate_core(void* dcontext, scheduler_t::stream_t *stream, int thread_id,
                 // instr = *disasm_info->instr;
                 // pc_instr_map[pc] = instr;
 
-                instr_init(dcontext, &instr);
+                instr_init(args.dcontext, &instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
-                app_pc _nextpc = decode_from_copy(dcontext, record.instr.encoding, decode_pc, &instr);
+                app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &instr);
                 (void)(_nextpc); // use it
                 pc_instr_map[pc] = instr;
             }
 
             input_instr inst;
-            update_inst_registers(dcontext, record, instr, inst, verbose);
+            update_inst_registers(args.dcontext, record, instr, inst, args.verbose);
             inst.ip = record.instr.addr;
             assert(inst.ip != 0);
             update_branch_info(record, inst);
@@ -505,7 +511,10 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
                    std::vector<SimStats> &all_stats,
                    const std::string &output_file_path,
                    const std::string &output_file_name,
-                   int num_cores) {
+                   int num_cores,
+                   uint64_t instruction_cap_global,
+                   uint64_t instruction_cap_local
+                ) {
     scheduler_t scheduler;
     std::vector<scheduler_t::input_workload_t> sched_inputs;
     sched_inputs.emplace_back(trace_directory);
@@ -544,13 +553,36 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     }
     disassemble_set_syntax(flags);
 
+    std::string output_better = output_file_path;
+    if (!output_better.empty() && output_better.back() != '/' && output_better.back() != '\\') {
+        output_better += "/";
+    }
+    output_better += output_file_name;
+
     all_stats.resize(safe_num_cast<unsigned>(num_cores));
     std::vector<std::thread> threads;
+    std::vector<thread_args> args;
     threads.reserve(safe_num_cast<unsigned>(num_cores));
+    args.reserve(safe_num_cast<unsigned>(num_cores));
+    std::atomic<uint64_t> g_global_inst_count;
     for (int i = 0; i < num_cores; ++i) {
-        threads.emplace_back([dcontext, i, &scheduler, verbose, &all_stats, &output_file_path, &output_file_name]() {
-            simulate_core(dcontext, scheduler.get_stream(i), i, verbose, all_stats[safe_num_cast<unsigned>(i)],
-                          output_file_path, output_file_name);
+        args.push_back(thread_args {
+            /* .dcontext = */ dcontext,
+            /* .stream = */ scheduler.get_stream(i),
+            /* .thread_id = */ i,
+            /* .verbose = */ verbose,
+            /* .stats = */ all_stats[safe_num_cast<unsigned>(i)],
+            /* .output_file_without_suffix = */ output_better,
+            /* .instruction_cap_global = */ instruction_cap_global,
+            /* .g_global_inst_count = */ std::ref(g_global_inst_count),
+            /* .instruction_cap_local = */ instruction_cap_local,
+        });
+    }
+    // Must do this in a separate for loop to avoid race condition of vector getting resized and moving elements before thread starts
+    for (int i = 0; i < num_cores; ++i) {
+        thread_args &my_args = args.back();
+        threads.emplace_back([&my_args]() {
+            simulate_core(my_args);
         });
     }
     for (std::thread &thread : threads) {
@@ -587,8 +619,9 @@ int main(int argc, char *argv[]) {
     std::string trace_directory;
     std::string output_file_path = ".";
     std::string output_file_name = "bravo";
-    bool verbose = true;
-    size_t target_count = 0;
+    bool verbose = false;
+    uint64_t percore_target_count = 0;
+    uint64_t global_target_count = 0;
     int num_cores = 0;
 
     int opt;
@@ -598,12 +631,13 @@ int main(int argc, char *argv[]) {
         {"output_file_path", required_argument, 0, 'p'},
         {"output_file_name", required_argument, 0, 'f'},  // Changed from -n to -f.
         {"num_cores",        required_argument, 0, 'n'},  // New option for number of cores.
-        {"quiet",            no_argument,       0, 'q'},
-        {"target_count",     required_argument, 0, 'c'},
+        {"verbose",            no_argument,       0, 'v'},
+        {"percore_target_count",    optional_argument, 0, 'c'}, // cap the per-core instruction count
+        {"global_target_count",     optional_argument, 0, 'g'}, // cap the global instruction count
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "t:p:f:n:qc:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:p:f:n:qc:g:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't':
                 trace_directory = optarg;
@@ -617,11 +651,14 @@ int main(int argc, char *argv[]) {
             case 'n':  // Number of cores option.
                 num_cores = std::stoi(optarg);
                 break;
-            case 'q':
-                verbose = false;
+            case 'v':
+                verbose = true;
                 break;
             case 'c':
-                target_count = std::stoull(optarg);
+                percore_target_count = std::stoull(optarg);
+                break;
+            case 'g':
+                global_target_count = std::stoull(optarg);
                 break;
             default:
                 std::cerr << "Usage: " << argv[0]
@@ -637,13 +674,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    g_target_inst_count = target_count;
-
     setrlim();
 
     std::vector<SimStats> thread_stats;
     auto start = std::chrono::high_resolution_clock::now();
-    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name, num_cores);
+    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name, num_cores, percore_target_count, global_target_count);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 

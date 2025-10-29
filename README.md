@@ -23,3 +23,4 @@ There is no need to build ChampSim, as we just need its header files.
 * turn quiet into verbose
 * download google trace instructions
 * usage instructions
+* actually implement global instruction cap
