@@ -78,6 +78,12 @@ If you want to do multicore simulations, read the above statements carefully. Ch
 
 The expected output IPC is low: less than 1 on every workload except `arizona`. Good luck. 
 
+## Things I am not confident in
+
+* main.cpp:520-540  Is this the right way to "decode" the instruction?
+* Are the flags extracted from DynamoRIO trustworthy or obfuscated? We rely on them being trustworthy, given that we never generate FLAGS dependencies (except for branches) since it's a "magic" register.
+* We also don't generate stack dependencies, since it's a magic register that is obfuscated. I should expand the dependency remapping to include the stack pointer, since branches often rely on it, and right now it has no dependencies.
+
 # Credits
 
 The original converter was written by Kan Zhu. It has been heavily reworked by Matthew Giordano, who now maintains this repo.
