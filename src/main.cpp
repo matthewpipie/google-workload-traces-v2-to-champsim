@@ -126,76 +126,117 @@ struct SimStats {
 // Helper functions for register assignment.
 // For non-branch instructions, we add an offset of 100 to registers;
 // for branch instructions, we use the register value as-is.
+// Why?
+// Unfortunately, the Google traces anonymized all registers and combined several,
+// so there is no way to map them to real registers.
+// However, ChampSim has 3 "special" registers, where reading/writing to them have special effects on the frontend unlike most general purpose registers:
+// the stack pointer, the instruction pointer, and the flags register.
+// Namely, for normal instructions, the stack pointer's dependencies are less strict than GPRs, because
+// one can almost always determine the new value of the stack pointer post-decode instead of having to wait post-writeback.
+// Google anonymized registers, so we don't know which is the stack pointer, so ChampSim won't be able to make this optimization,
+// leading to slower traces.
+// The other use of the SP and IP in ChampSim is to reverse engineer the branch type.
+// Instead of containing branch type in the trace struct,
+// ChampSim reverse engineers this via looking at:
+// * `is_branch`
+// * `branch_taken`
+// * `writes_sp`, `reads_sp`
+// * `writes_ip`, `reads_ip`
+// * `reads_flags` (luckily it seems like the flags register was not anonymized... I hope not, anyways!)
+// * `reads_other` (any other register)
+// This code is present in ChampSim/inc/instruction.h
+// Why is this all relevant?
+// ChampSim uses magic register numbers to refer to the SP and IP. 
+// DynamoRIO has different magic register numbers for each register.
+// We need to make sure we don't accidently create false dependencies with the magic SP and IP register numbers.
+// So, we add 100 to each register to completely avoid the SP, IP, and flags registers, which are, in practice, at offset 6, 26, and 25.
+// When adding a branch register dependency, we are adding a dependency to SP, IP, or flags, so we don't add anything.
+//
+// Also, there is one more important caveat.
+// ChampSim assumes x86 has a limit of 4 input registers and 4 input memory addresses per instruction,
+// and a limit of 2 output registers and 2 output memory address per instruction.
+// However, the Google anonymization process seems to, for some reason, occasionally give instructions 5 inputs or 3 outputs.
+// In practice, this appears to be super rare (100,000 faults when processing billions of instructions), but it varies per workload,
+// so be sure to note it.
 
-bool addSrcRegister(input_instr &champsim_instr, int &srcCount, uint8_t reg, bool verbose) {
+constexpr ssize_t REG_DEPENDENCY_OFFSET = 100;
+
+static_assert(REG_DEPENDENCY_OFFSET > REG_STACK_POINTER,
+              "Register dependency offset must exceed stack pointer magic register ID");
+static_assert(REG_DEPENDENCY_OFFSET > REG_FLAGS,
+              "Register dependency offset must exceed flags magic register ID");
+static_assert(REG_DEPENDENCY_OFFSET > REG_INSTRUCTION_POINTER,
+              "Register dependency offset must exceed instruction pointer magic register ID");
+
+bool addSrcRegister(input_instr &champsim_instr, int &srcCount, ushort reg, bool verbose) {
     if (srcCount >= 4) {
         if (verbose) std::cerr << "Too many source registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_SRC_REGISTERS]++;
         return false;
     }
-    champsim_instr.source_registers[srcCount++] = reg + 100;
+    champsim_instr.source_registers[srcCount++] = safe_num_cast<unsigned char>(reg + REG_DEPENDENCY_OFFSET);
     return true;
 }
 
-bool addDstRegister(input_instr &champsim_instr, int &dstCount, uint8_t reg, bool verbose) {
+bool addDstRegister(input_instr &champsim_instr, int &dstCount, ushort reg, bool verbose) {
     if (dstCount >= 2) {
         if (verbose) std::cerr << "Too many destination registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_DST_REGISTERS]++;
         return false;
     }
-    champsim_instr.destination_registers[dstCount++] = reg + 100;
+    champsim_instr.destination_registers[dstCount++] = safe_num_cast<unsigned char>(reg + REG_DEPENDENCY_OFFSET);
     return true;
 }
 
 // Branch register helpers: no offset added.
-bool addSrcRegisterForBranch(input_instr &champsim_instr, int &srcCount, uint8_t reg, bool verbose, BranchType bType) {
+bool addSrcRegisterForBranch(input_instr &champsim_instr, int &srcCount, ushort reg, bool verbose, BranchType bType) {
     if (srcCount >= 4) {
         if (verbose) std::cerr << "Too many source registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_src_overflow_counts[bType]++;
         return false;
     }
-    champsim_instr.source_registers[srcCount++] = reg;
+    champsim_instr.source_registers[srcCount++] = safe_num_cast<unsigned char>(reg);
     return true;
 }
 
-bool addDstRegisterForBranch(input_instr &champsim_instr, int &dstCount, uint8_t reg, bool verbose, BranchType bType) {
+bool addDstRegisterForBranch(input_instr &champsim_instr, int &dstCount, ushort reg, bool verbose, BranchType bType) {
     if (dstCount >= 2) {
         if (verbose) std::cerr << "Too many destination registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_dst_overflow_counts[bType]++;
         return false;
     }
-    champsim_instr.destination_registers[dstCount++] = reg;
+    champsim_instr.destination_registers[dstCount++] = safe_num_cast<unsigned char>(reg);
     return true;
 }
 
-bool addSrcRegisters(input_instr &champsim_instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose) {
-    for (uint8_t reg : regs) {
+bool addSrcRegisters(input_instr &champsim_instr, int &srcCount, const std::vector<ushort> &regs, bool verbose) {
+    for (ushort reg : regs) {
         if (!addSrcRegister(champsim_instr, srcCount, reg, verbose))
             return false;
     }
     return true;
 }
 
-bool addDstRegisters(input_instr &champsim_instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose) {
-    for (uint8_t reg : regs) {
+bool addDstRegisters(input_instr &champsim_instr, int &dstCount, const std::vector<ushort> &regs, bool verbose) {
+    for (ushort reg : regs) {
         if (!addDstRegister(champsim_instr, dstCount, reg, verbose))
             return false;
     }
     return true;
 }
 
-bool addSrcRegistersForBranch(input_instr &champsim_instr, int &srcCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
-    for (uint8_t reg : regs) {
+bool addSrcRegistersForBranch(input_instr &champsim_instr, int &srcCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
+    for (ushort reg : regs) {
         if (!addSrcRegisterForBranch(champsim_instr, srcCount, reg, verbose, bType))
             return false;
     }
     return true;
 }
 
-bool addDstRegistersForBranch(input_instr &champsim_instr, int &dstCount, const std::vector<uint8_t> &regs, bool verbose, BranchType bType) {
-    for (uint8_t reg : regs) {
+bool addDstRegistersForBranch(input_instr &champsim_instr, int &dstCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
+    for (ushort reg : regs) {
         if (!addDstRegisterForBranch(champsim_instr, dstCount, reg, verbose, bType))
             return false;
     }
@@ -214,7 +255,7 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, int &srcCount, int
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect jump" << std::endl;
-                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(rand() % 16 + 50), verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<ushort>(rand() % 16 + 50), verbose, bType))
                     return false;
             }
             break;
@@ -235,7 +276,7 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, int &srcCount, int
         case TRACE_TYPE_INSTR_INDIRECT_CALL:
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect call" << std::endl;
-                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(rand() % 16 + 50), verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<ushort>(rand() % 16 + 50), verbose, bType))
                     return false;
             }
             if (!addSrcRegistersForBranch(champsim_input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
@@ -271,7 +312,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
         if (verbose) {
             std::cout << "src register: " << reg << std::endl;
         }
-        if (!addSrcRegister(champsim_input_instr, srcCount, safe_num_cast<uint8_t>(reg), verbose))
+        if (!addSrcRegister(champsim_input_instr, srcCount, safe_num_cast<ushort>(reg), verbose))
             return;
     }
 
@@ -281,7 +322,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
         if (verbose) {
             std::cout << "dst register: " << reg << std::endl;
         }
-        if (!addDstRegister(champsim_input_instr, dstCount, safe_num_cast<uint8_t>(reg), verbose))
+        if (!addDstRegister(champsim_input_instr, dstCount, safe_num_cast<ushort>(reg), verbose))
             return;
     }
 
