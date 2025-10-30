@@ -88,7 +88,8 @@ const char* branch_type_names[] = {
     "Return",
     "Taken Jump",
     "Untaken Jump",
-    "Conditional Jump"
+    "Conditional Jump",
+    "Invalid Branch"
 };
 
 // Convert from DynamoRIO branch type to our internal branch type
@@ -276,8 +277,6 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, unsigned &srcCount
         case TRACE_TYPE_INSTR_TAKEN_JUMP:
         case TRACE_TYPE_INSTR_UNTAKEN_JUMP:
             // Conditional branches read and write IP, and read (flags || other)
-            if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_INSTRUCTION_POINTER, verbose, bType))
-                return false;
             // Similarly to above, generate a random dependency if none exists
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for conditional jump" << std::endl;
@@ -291,6 +290,8 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, unsigned &srcCount
                         return false;
                 }
             }
+            if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_INSTRUCTION_POINTER, verbose, bType))
+                return false;
             break;
         case TRACE_TYPE_INSTR_DIRECT_CALL:
             // Reads IP, SP, writes IP, SP, doesn't read flags or other
@@ -306,7 +307,7 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, unsigned &srcCount
                 if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, 0, verbose, bType)) return false;
             }
             for (unsigned i = dstCount; i < REG_DST_NUM_INSTR; i++) {
-                if (!addDstRegisterForBranch(champsim_input_instr, srcCount, 0, verbose, bType)) return false;
+                if (!addDstRegisterForBranch(champsim_input_instr, dstCount, 0, verbose, bType)) return false;
             }
             break;
         case TRACE_TYPE_INSTR_INDIRECT_CALL:
@@ -671,7 +672,7 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
     std::vector<thread_args> args;
     threads.reserve(safe_num_cast<unsigned>(num_cores));
     args.reserve(safe_num_cast<unsigned>(num_cores));
-    std::atomic<uint64_t> g_global_inst_count;
+    std::atomic<uint64_t> g_global_inst_count{0};
     for (int i = 0; i < num_cores; ++i) {
         args.push_back(thread_args {
             /* .dcontext = */ dcontext,
