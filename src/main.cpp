@@ -769,7 +769,7 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 std::cerr << "Usage: " << argv[0]
-                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--percore_target_count <num>] [--global_target_count <num>]\n";
+                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--verbose] [--percore_target_count <num>] [--global_target_count <num>]\n";
                 return 1;
         }
     }
@@ -777,7 +777,7 @@ int main(int argc, char *argv[]) {
     if (trace_directory.empty()) {
         std::cerr << "Error: --trace_folder is required.\n";
         std::cerr << "Usage: " << argv[0]
-                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--percore_target_count <num>] [--global_target_count <num>]\n";
+                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--verbose] [--percore_target_count <num>] [--global_target_count <num>]\n";
         return 1;
     }
 
