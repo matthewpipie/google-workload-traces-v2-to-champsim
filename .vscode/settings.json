@@ -79,5 +79,6 @@
         "filesystem": "cpp",
         "queue": "cpp",
         "stack": "cpp"
-    }
+    },
+    "C_Cpp.default.cppStandard": "c++17"
 }

@@ -345,24 +345,28 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
     unsigned dstCount = 0;
     uint used_flag = instr_get_arith_flags(&dr_instr, DR_QUERY_DEFAULT);
 
-    for (int i = 0; i < instr_num_srcs(&dr_instr); i++) {
-        opnd_t opnd = instr_get_src(&dr_instr, safe_num_cast<uint>(i));
-        reg_id_t reg = opnd_get_reg_used(opnd, 0);
-        if (verbose) {
-            std::cout << "src register: " << reg << std::endl;
+    for (uint i = 0; i < safe_num_cast<uint>(instr_num_srcs(&dr_instr)); i++) {
+        opnd_t opnd = instr_get_src(&dr_instr, i);
+        for (int opnum = 0; opnum < opnd_num_regs_used(opnd); opnum++) {
+            reg_id_t reg = opnd_get_reg_used(opnd, opnum);
+            if (verbose) {
+                std::cout << "src register " << i << "," << opnum << ": " << reg << std::endl;
+            }
+            if (!addSrcRegister(champsim_input_instr, srcCount, safe_num_cast<ushort>(reg), verbose))
+                return;
         }
-        if (!addSrcRegister(champsim_input_instr, srcCount, safe_num_cast<ushort>(reg), verbose))
-            return;
     }
 
-    for (int i = 0; i < instr_num_dsts(&dr_instr); i++) {
-        opnd_t opnd = instr_get_dst(&dr_instr, safe_num_cast<uint>(i));
-        reg_id_t reg = opnd_get_reg_used(opnd, 0);
-        if (verbose) {
-            std::cout << "dst register: " << reg << std::endl;
+    for (uint i = 0; i < safe_num_cast<uint>(instr_num_dsts(&dr_instr)); i++) {
+        opnd_t opnd = instr_get_dst(&dr_instr, i);
+        for (int opnum = 0; opnum < opnd_num_regs_used(opnd); opnum++) {
+            reg_id_t reg = opnd_get_reg_used(opnd, opnum);
+            if (verbose) {
+                std::cout << "dst register " << i << "," << opnum << ": " << reg << std::endl;
+            }
+            if (!addDstRegister(champsim_input_instr, dstCount, safe_num_cast<ushort>(reg), verbose))
+                return;
         }
-        if (!addDstRegister(champsim_input_instr, dstCount, safe_num_cast<ushort>(reg), verbose))
-            return;
     }
 
     if (TESTANY(EFLAGS_WRITE_ARITH, used_flag)) {

@@ -16,7 +16,6 @@ There is no need to build ChampSim, as we just need its header files.
 ## Running
 
 # TODO
-* correctly get out all dependencies
 * download google trace instructions
 * usage instructions
 * clang is not supported by dynamorio
