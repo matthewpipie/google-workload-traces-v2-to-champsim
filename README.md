@@ -16,11 +16,8 @@ There is no need to build ChampSim, as we just need its header files.
 ## Running
 
 # TODO
-* type safe rand
-* fix up rand
-* fix args +100 stuff to be in the right type after adding
-* fix up entire schedule function (weird map thing)
 * correctly get out all dependencies
 * download google trace instructions
 * usage instructions
 * clang is not supported by dynamorio
+* python script
