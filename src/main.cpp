@@ -306,8 +306,9 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
         }
     }
 
-    if (!assignBranchRegisters(champsim_input_instr, srcCount, dstCount, record.instr.type, verbose))
+    if (!assignBranchRegisters(champsim_input_instr, srcCount, dstCount, record.instr.type, verbose)) {
         return;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -347,7 +348,7 @@ void update_branch_info(memref_t record, input_instr &champsim_input_instr) {
 }
 
 struct thread_args {
-    void* dcontext; // DynamoRIO context, not thread safe, to be removed
+    void* dcontext; // DynamoRIO context for decoding, note: not fully thread safe, but should be "safe enough" for our usage
     scheduler_t::stream_t *stream; // Instruction stream
     const int thread_id;
     const bool verbose;
@@ -399,9 +400,6 @@ void simulate_core(thread_args &args) {
         assert(status == scheduler_t::STATUS_OK);
         
         if (type_is_instr(record.instr.type)) {
-            //size_t count = g_global_inst_count.fetch_add(1) + 1;
-            //if (g_target_inst_count != 0 && count >= g_target_inst_count)
-                //break;
             stats.total_insts++;
             if (stats.total_insts % 1000000 == 0) {
                 auto elapsed_time = std::chrono::high_resolution_clock::now() - start_time;
@@ -421,32 +419,51 @@ void simulate_core(thread_args &args) {
                           << std::dec << std::setfill(' ') << "\n";
             }
 
+            // We need to "decode" the instruction to get all of its operands, etc.
+            // To make this faster, we cache known decodes in the map `pc_instr_map`
             size_t pc = record.instr.addr;
             auto it = pc_instr_map.find(pc);
             instr_t dr_instr;
-            if (it != pc_instr_map.end()) {
+            if (it != pc_instr_map.end() && !record.instr.encoding_is_new) {
+                // cache hit
                 dr_instr = it->second;
             } else {
-                // TODO: clean this up.
+                // cache miss
+                // decode
                 instr_init(args.dcontext, &dr_instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
+                // It's unclear if we need to use decode_from_copy() or if we can just use decode()
+                // It's also unclear if the second argument here is correct
                 app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &dr_instr);
-                (void)(_nextpc); // use it
+                (void)(_nextpc);
+                // Write into decode cache
                 pc_instr_map[pc] = dr_instr;
             }
 
+            // Now, convert DynamoRIO instruction into ChampSim instruction
             input_instr champsim_inst;
+            // There are four parts to a CS instruction:
+            //  * ip
+            //  * branch info
+            //  * src, dest regs
+            //  * src, dest mems
+            
+            // Copy src, dest regs
             update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, args.verbose);
+            
+            // Copy ip
             champsim_inst.ip = record.instr.addr;
             assert(champsim_inst.ip != 0);
-            update_branch_info(record, champsim_inst);
 
+            // Copy branch info
+            update_branch_info(record, champsim_inst);
             if (champsim_inst.is_branch) {
                 stats.branch_count++;
                 BranchType bType = getBranchType(record.instr.type);
                 stats.branch_type_counts[bType]++;
             }
             
+            // Copy src, dest memory dependencies
             // In order to get memory source and destination information about this instruction, 
             // we need to read the next record.
             // Sort of annoyingly repetitive but alas...
@@ -486,9 +503,12 @@ void simulate_core(thread_args &args) {
                 }
                 status = stream->next_record(new_record);
             }
-            gzwrite(gz_out, &champsim_inst, sizeof(champsim_inst));
-            record = new_record;
 
+            // Done, write out to gz file
+            gzwrite(gz_out, &champsim_inst, sizeof(champsim_inst));
+            record = new_record; // copy over the next record from the above code block
+
+            // Break conditions
             if (args.instruction_cap_local != 0 && stats.total_insts >= args.instruction_cap_local) {
                 break;
             }
