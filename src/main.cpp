@@ -788,8 +788,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (trace_directory.empty()) {
-        std::cerr << "Error: --trace_folder is required.\n";
+    if (trace_directory.empty() || num_cores == 0) {
+        std::cerr << "Error: --trace_folder and --num_cores are required.\n";
         std::cerr << "Usage: " << argv[0]
                   << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--verbose] [--percore_target_count <num>] [--global_target_count <num>]\n";
         return 1;
