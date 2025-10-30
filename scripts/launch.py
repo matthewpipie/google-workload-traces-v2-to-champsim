@@ -7,7 +7,7 @@ import os
 
 trace_base_path = "/mnt/storage/traces/gtrace_v2/external-traces-v2/"
 output_dir = "/mnt/storage/traces/gtrace_v2_champsim/"
-num_instructions_per_core = "100000000000"
+num_instructions_per_core = "100000000"
 
 # The program will crash if the open limit cap isn't increased.
 # Get the current soft and hard limits for open files
