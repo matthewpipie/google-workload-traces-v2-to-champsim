@@ -45,6 +45,8 @@ enum FaultType {
     FAULT_DATA_PC_MISMATCH,
     FAULT_TOO_MANY_SRC_REGISTERS,
     FAULT_TOO_MANY_DST_REGISTERS,
+    FAULT_TOO_MANY_SRC_MEMORY,
+    FAULT_TOO_MANY_DST_MEMORY,
     FAULT_MAX
 };
 
@@ -54,6 +56,8 @@ const char *fault_names[FAULT_MAX + 1] = {
     "Data PC mismatch",
     "Too many source registers",
     "Too many destination registers",
+    "Too many source memory references",
+    "Too many destination memory references",
     "MAX"
 };
 
@@ -385,8 +389,6 @@ void simulate_core(thread_args &args) {
     
     memref_t record;
     scheduler_t::stream_status_t status = stream->next_record(record);
-    size_t local_count = 0;
-    int64_t last_tid = -1245632134;
     
     while (status != scheduler_t::STATUS_EOF) {
         if (status == scheduler_t::STATUS_WAIT || status == scheduler_t::STATUS_IDLE) {
@@ -400,81 +402,58 @@ void simulate_core(thread_args &args) {
             //size_t count = g_global_inst_count.fetch_add(1) + 1;
             //if (g_target_inst_count != 0 && count >= g_target_inst_count)
                 //break;
-            local_count++;
-            if (args.instruction_cap_local != 0 && local_count >= args.instruction_cap_local) {
-                break;
-            }
-            //if (count % 100000 == 0) {
-            if (local_count % 1000000 == 0) {
+            stats.total_insts++;
+            if (stats.total_insts % 1000000 == 0) {
                 auto elapsed_time = std::chrono::high_resolution_clock::now() - start_time;
                 double elapsed_seconds = std::chrono::duration<double>(elapsed_time).count();
                 print_mutex.lock();
-                std::cout << "Processed " << local_count << " instructions, " << " Core " <<  args.thread_id << " cache size: " 
-                          //<< decode_cache_->decode_cache_.size()
-                          << "TODO"
+                std::cout << " Core " <<  args.thread_id << " Processed " << stats.total_insts << " instructions, "
                           << " Elapsed time: "
                           << elapsed_seconds << " seconds" << ", MI/s: "
-                          << ((double)(local_count) / 1000000.0) / elapsed_seconds << "\n";
+                          << ((double)(stats.total_insts) / 1000000.0) / elapsed_seconds << "\n";
                 print_mutex.unlock();
             }
-            stats.total_insts++;
-            // if (decode_cache_->decode_cache_.size() > 200000) {
-            //     std::cerr << "Cache size exceeded 200000, clearing cache\n";
-            //     decode_cache_->decode_cache_.clear();
-            // }
 
             if (args.verbose) {
                 std::cout << std::left << std::setw(12) << "ifetch" << std::right
                           << std::setw(2) << record.instr.size << " byte(s) @ 0x" << std::hex
                           << std::setfill('0') << std::setw(sizeof(void *) * 2) << record.instr.addr
                           << std::dec << std::setfill(' ') << "\n";
-                // std::cout << disasm_info->disasm_;
-            }
-
-            int64_t cur_tid = record.instr.tid;
-            if (last_tid != cur_tid) {
-                    // core id, instr count, thread id
-                print_mutex.lock();
-                std::cout << "***" << args.thread_id << "," << local_count << "," << cur_tid << "\n";
-                print_mutex.unlock();
-                last_tid = cur_tid;
             }
 
             size_t pc = record.instr.addr;
             auto it = pc_instr_map.find(pc);
-            instr_t instr;
+            instr_t dr_instr;
             if (it != pc_instr_map.end()) {
-                instr = it->second;
+                dr_instr = it->second;
             } else {
-                // disasm_info_t *disasm_info;
-                // std::string error_string = decode_cache_->add_decode_info(record.instr, disasm_info);
-                // instr = *disasm_info->instr;
-                // pc_instr_map[pc] = instr;
-
-                instr_init(args.dcontext, &instr);
+                // TODO: clean this up.
+                instr_init(args.dcontext, &dr_instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
-                app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &instr);
+                app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &dr_instr);
                 (void)(_nextpc); // use it
-                pc_instr_map[pc] = instr;
+                pc_instr_map[pc] = dr_instr;
             }
 
-            input_instr inst;
-            update_inst_registers(args.dcontext, record, instr, inst, args.verbose);
-            inst.ip = record.instr.addr;
-            assert(inst.ip != 0);
-            update_branch_info(record, inst);
+            input_instr champsim_inst;
+            update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, args.verbose);
+            champsim_inst.ip = record.instr.addr;
+            assert(champsim_inst.ip != 0);
+            update_branch_info(record, champsim_inst);
 
-            if (inst.is_branch) {
+            if (champsim_inst.is_branch) {
                 stats.branch_count++;
                 BranchType bType = getBranchType(record.instr.type);
-                if (bType != BRANCH_INVALID)
-                    stats.branch_type_counts[bType]++;
+                stats.branch_type_counts[bType]++;
             }
             
+            // In order to get memory source and destination information about this instruction, 
+            // we need to read the next record.
+            // Sort of annoyingly repetitive but alas...
             memref_t new_record;
             status = stream->next_record(new_record);
-            int inst_source_memory = 0;
-            int inst_dest_memory = 0;
+            size_t inst_source_memory = 0;
+            size_t inst_dest_memory = 0;
             while (status != scheduler_t::STATUS_EOF &&
                    (new_record.instr.type == TRACE_TYPE_READ || new_record.instr.type == TRACE_TYPE_WRITE)) {
                 if (status == scheduler_t::STATUS_WAIT || status == scheduler_t::STATUS_IDLE) {
@@ -488,16 +467,38 @@ void simulate_core(thread_args &args) {
                     failure_counts[FAULT_DATA_PC_MISMATCH]++;
                 }
                 if (new_record.instr.type == TRACE_TYPE_READ) {
-                    inst.source_memory[inst_source_memory++] = new_record.instr.addr;
+                    if (inst_source_memory >= std::size(champsim_inst.source_memory)) {
+                        if (args.verbose) std::cerr << "Too many source memory" << std::endl;
+                        failure_counts[FAULT_TOO_MANY_SRC_MEMORY]++;
+                    } else {
+                        champsim_inst.source_memory[inst_source_memory++] = new_record.instr.addr;
+                    }
                     assert(new_record.instr.addr != 0);
                 } else {
-                    inst.destination_memory[inst_dest_memory++] = new_record.instr.addr;
+                    assert(new_record.instr.type == TRACE_TYPE_WRITE);
+                    if (inst_dest_memory >= std::size(champsim_inst.destination_memory)) {
+                        if (args.verbose) std::cerr << "Too many destination memory" << std::endl;
+                        failure_counts[FAULT_TOO_MANY_DST_MEMORY]++;
+                    } else {
+                        champsim_inst.destination_memory[inst_dest_memory++] = new_record.instr.addr;
+                    }
                     assert(new_record.instr.addr != 0);
                 }
                 status = stream->next_record(new_record);
             }
-            gzwrite(gz_out, &inst, sizeof(inst));
+            gzwrite(gz_out, &champsim_inst, sizeof(champsim_inst));
             record = new_record;
+
+            if (args.instruction_cap_local != 0 && stats.total_insts >= args.instruction_cap_local) {
+                break;
+            }
+            if (args.instruction_cap_global != 0) {
+                uint64_t new_val = args.g_global_inst_count.fetch_add(1) + 1;
+                if (new_val >= args.instruction_cap_global) {
+                    break;
+                }
+            }
+
         } else {
             status = stream->next_record(record);
         }
@@ -579,8 +580,8 @@ void run_scheduler(const std::string &trace_directory, bool verbose,
         });
     }
     // Must do this in a separate for loop to avoid race condition of vector getting resized and moving elements before thread starts
-    for (int i = 0; i < num_cores; ++i) {
-        thread_args &my_args = args.back();
+    for (size_t i = 0; i < safe_num_cast<size_t>(num_cores); ++i) {
+        thread_args &my_args = args[i];
         threads.emplace_back([&my_args]() {
             simulate_core(my_args);
         });
@@ -632,8 +633,8 @@ int main(int argc, char *argv[]) {
         {"output_file_name", required_argument, 0, 'f'},  // Changed from -n to -f.
         {"num_cores",        required_argument, 0, 'n'},  // New option for number of cores.
         {"verbose",            no_argument,       0, 'v'},
-        {"percore_target_count",    optional_argument, 0, 'c'}, // cap the per-core instruction count
-        {"global_target_count",     optional_argument, 0, 'g'}, // cap the global instruction count
+        {"percore_target_count",    required_argument, 0, 'c'}, // cap the per-core instruction count
+        {"global_target_count",     required_argument, 0, 'g'}, // cap the global instruction count
         {0, 0, 0, 0}
     };
 
@@ -662,7 +663,7 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 std::cerr << "Usage: " << argv[0]
-                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--target_count <num>]\n";
+                          << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--percore_target_count <num>] [--global_target_count <num>]\n";
                 return 1;
         }
     }
@@ -670,7 +671,7 @@ int main(int argc, char *argv[]) {
     if (trace_directory.empty()) {
         std::cerr << "Error: --trace_folder is required.\n";
         std::cerr << "Usage: " << argv[0]
-                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--target_count <num>]\n";
+                  << " --trace_folder <folder> [--output_file_path <path>] [--output_file_name <name>] [--num_cores <num>] [--quiet] [--percore_target_count <num>] [--global_target_count <num>]\n";
         return 1;
     }
 
@@ -678,7 +679,7 @@ int main(int argc, char *argv[]) {
 
     std::vector<SimStats> thread_stats;
     auto start = std::chrono::high_resolution_clock::now();
-    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name, num_cores, percore_target_count, global_target_count);
+    run_scheduler(trace_directory, verbose, thread_stats, output_file_path, output_file_name, num_cores, global_target_count, percore_target_count);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 

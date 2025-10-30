@@ -18,9 +18,8 @@ There is no need to build ChampSim, as we just need its header files.
 # TODO
 * type safe rand
 * fix up rand
-* fix up entire schedule function
-* create per-thread args
-* turn quiet into verbose
+* fix args +100 stuff to be in the right type after adding
+* fix up entire schedule function (weird map thing)
 * download google trace instructions
 * usage instructions
-* actually implement global instruction cap
+* clang is not supported by dynamorio
