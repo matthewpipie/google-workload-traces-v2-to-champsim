@@ -74,6 +74,8 @@ I'm still looking into this.
 
 Each core tends to behave fairly differently, i.e. threads are not randomly multiplexed onto cores. Sampling only a subset of the cores to simulate in ChampSim is a bad idea, as is scheduling onto a different number of cores than Google recommends.
 
+If you want to do multicore simulations, read the above statements carefully. ChampSim does not model multithreading within a process. You can run multiple cores of `arizona` in the same, multicore instance of ChampSim, but they will not share data, and it will be as if any other workload is running on that second core.
+
 The expected output IPC is low: less than 1 on every workload except `arizona`. Good luck. 
 
 # Credits
