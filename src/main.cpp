@@ -33,6 +33,7 @@
 
 // my headers
 #include "safe_num_cast.hpp"
+#include "threadsafe_rand.hpp"
 
 using namespace dynamorio::drmemtrace;
 using namespace champsim;
@@ -168,8 +169,16 @@ static_assert(REG_DEPENDENCY_OFFSET > REG_FLAGS,
 static_assert(REG_DEPENDENCY_OFFSET > REG_INSTRUCTION_POINTER,
               "Register dependency offset must exceed instruction pointer magic register ID");
 
-bool addSrcRegister(input_instr &champsim_instr, int &srcCount, ushort reg, bool verbose) {
-    if (srcCount >= 4) {
+constexpr unsigned char RAND_REG_RANGE_MIN = REG_DEPENDENCY_OFFSET;
+constexpr unsigned char RAND_REG_RANGE_MAX = RAND_REG_RANGE_MIN + 15; // 16 registers roughly, this is an inclusive max
+
+constexpr unsigned REG_SRC_NUM_INSTR = NUM_INSTR_SOURCES;
+constexpr unsigned REG_DST_NUM_INSTR = NUM_INSTR_DESTINATIONS;
+constexpr unsigned MEM_SRC_NUM_INSTR = NUM_INSTR_SOURCES;
+constexpr unsigned MEM_DST_NUM_INSTR = NUM_INSTR_DESTINATIONS;
+
+bool addSrcRegister(input_instr &champsim_instr, unsigned &srcCount, ushort reg, bool verbose) {
+    if (srcCount >= REG_SRC_NUM_INSTR) {
         if (verbose) std::cerr << "Too many source registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_SRC_REGISTERS]++;
         return false;
@@ -178,8 +187,8 @@ bool addSrcRegister(input_instr &champsim_instr, int &srcCount, ushort reg, bool
     return true;
 }
 
-bool addDstRegister(input_instr &champsim_instr, int &dstCount, ushort reg, bool verbose) {
-    if (dstCount >= 2) {
+bool addDstRegister(input_instr &champsim_instr, unsigned &dstCount, ushort reg, bool verbose) {
+    if (dstCount >= REG_DST_NUM_INSTR) {
         if (verbose) std::cerr << "Too many destination registers" << std::endl;
         failure_counts[FAULT_TOO_MANY_DST_REGISTERS]++;
         return false;
@@ -189,8 +198,8 @@ bool addDstRegister(input_instr &champsim_instr, int &dstCount, ushort reg, bool
 }
 
 // Branch register helpers: no offset added.
-bool addSrcRegisterForBranch(input_instr &champsim_instr, int &srcCount, ushort reg, bool verbose, BranchType bType) {
-    if (srcCount >= 4) {
+bool addSrcRegisterForBranch(input_instr &champsim_instr, unsigned &srcCount, ushort reg, bool verbose, BranchType bType) {
+    if (srcCount >= REG_SRC_NUM_INSTR) {
         if (verbose) std::cerr << "Too many source registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_src_overflow_counts[bType]++;
@@ -200,8 +209,8 @@ bool addSrcRegisterForBranch(input_instr &champsim_instr, int &srcCount, ushort 
     return true;
 }
 
-bool addDstRegisterForBranch(input_instr &champsim_instr, int &dstCount, ushort reg, bool verbose, BranchType bType) {
-    if (dstCount >= 2) {
+bool addDstRegisterForBranch(input_instr &champsim_instr, unsigned &dstCount, ushort reg, bool verbose, BranchType bType) {
+    if (dstCount >= REG_DST_NUM_INSTR) {
         if (verbose) std::cerr << "Too many destination registers for branch type " 
                               << branch_type_names[bType] << std::endl;
         branch_dst_overflow_counts[bType]++;
@@ -211,7 +220,7 @@ bool addDstRegisterForBranch(input_instr &champsim_instr, int &dstCount, ushort 
     return true;
 }
 
-bool addSrcRegisters(input_instr &champsim_instr, int &srcCount, const std::vector<ushort> &regs, bool verbose) {
+bool addSrcRegisters(input_instr &champsim_instr, unsigned &srcCount, const std::vector<ushort> &regs, bool verbose) {
     for (ushort reg : regs) {
         if (!addSrcRegister(champsim_instr, srcCount, reg, verbose))
             return false;
@@ -219,7 +228,7 @@ bool addSrcRegisters(input_instr &champsim_instr, int &srcCount, const std::vect
     return true;
 }
 
-bool addDstRegisters(input_instr &champsim_instr, int &dstCount, const std::vector<ushort> &regs, bool verbose) {
+bool addDstRegisters(input_instr &champsim_instr, unsigned &dstCount, const std::vector<ushort> &regs, bool verbose) {
     for (ushort reg : regs) {
         if (!addDstRegister(champsim_instr, dstCount, reg, verbose))
             return false;
@@ -227,7 +236,7 @@ bool addDstRegisters(input_instr &champsim_instr, int &dstCount, const std::vect
     return true;
 }
 
-bool addSrcRegistersForBranch(input_instr &champsim_instr, int &srcCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
+bool addSrcRegistersForBranch(input_instr &champsim_instr, unsigned &srcCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
     for (ushort reg : regs) {
         if (!addSrcRegisterForBranch(champsim_instr, srcCount, reg, verbose, bType))
             return false;
@@ -235,7 +244,7 @@ bool addSrcRegistersForBranch(input_instr &champsim_instr, int &srcCount, const 
     return true;
 }
 
-bool addDstRegistersForBranch(input_instr &champsim_instr, int &dstCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
+bool addDstRegistersForBranch(input_instr &champsim_instr, unsigned &dstCount, const std::vector<ushort> &regs, bool verbose, BranchType bType) {
     for (ushort reg : regs) {
         if (!addDstRegisterForBranch(champsim_instr, dstCount, reg, verbose, bType))
             return false;
@@ -246,50 +255,80 @@ bool addDstRegistersForBranch(input_instr &champsim_instr, int &dstCount, const 
 // -----------------------------------------------------------------------------
 // Helper: Consolidated branch-specific register assignments.
 // Uses specialized branch helpers (without offset).
-bool assignBranchRegisters(input_instr &champsim_input_instr, int &srcCount, int &dstCount, trace_type_t branchType, bool verbose) {
+bool assignBranchRegisters(input_instr &champsim_input_instr, unsigned &srcCount, unsigned &dstCount, trace_type_t branchType, bool verbose) {
     BranchType bType = getBranchType(branchType);
     switch (branchType) {
         case TRACE_TYPE_INSTR_DIRECT_JUMP:
             // No extra register needed.
+            // Caller already adds IP as a dest register.
             break;
         case TRACE_TYPE_INSTR_INDIRECT_JUMP:
+            // An indirect branch should really depend on a register
+            // If it doesn't, we should artificially add one to make sure ChampSim recognizes it as an indirect branch
+            // This could be considered a fault, I suppose
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect jump" << std::endl;
-                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<ushort>(rand() % 16 + 50), verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, threadsafe_rand<ushort>(RAND_REG_RANGE_MIN, RAND_REG_RANGE_MAX), verbose, bType))
                     return false;
             }
             break;
         case TRACE_TYPE_INSTR_CONDITIONAL_JUMP:
         case TRACE_TYPE_INSTR_TAKEN_JUMP:
         case TRACE_TYPE_INSTR_UNTAKEN_JUMP:
+            // Conditional branches read and write IP, and read (flags || other)
             if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_INSTRUCTION_POINTER, verbose, bType))
                 return false;
+            // Similarly to above, generate a random dependency if none exists
+            if (srcCount == 0) {
+                if (verbose) std::cout << "Adding random register for conditional jump" << std::endl;
+                if (threadsafe_rand<int>(0, 1) == 0) {
+                    // random register
+                    if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, threadsafe_rand<ushort>(RAND_REG_RANGE_MIN, RAND_REG_RANGE_MAX), verbose, bType))
+                        return false;
+                } else {
+                    // flags
+                    if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_FLAGS, verbose, bType))
+                        return false;
+                }
+            }
             break;
         case TRACE_TYPE_INSTR_DIRECT_CALL:
+            // Reads IP, SP, writes IP, SP, doesn't read flags or other
+            // To do this, we overwrite all src and dest regs
             srcCount = 0;
             if (!addSrcRegistersForBranch(champsim_input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
             dstCount = 0;
             if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
+            // Zero out remaining fields
+            for (unsigned i = srcCount; i < REG_SRC_NUM_INSTR; i++) {
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, 0, verbose, bType)) return false;
+            }
+            for (unsigned i = dstCount; i < REG_DST_NUM_INSTR; i++) {
+                if (!addDstRegisterForBranch(champsim_input_instr, srcCount, 0, verbose, bType)) return false;
+            }
             break;
         case TRACE_TYPE_INSTR_INDIRECT_CALL:
+            // Reads IP, SP
+            // Writes IP, SP
+            // Reads other, doesn't read flags
             if (srcCount == 0) {
                 if (verbose) std::cout << "Adding random register for indirect call" << std::endl;
-                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, safe_num_cast<ushort>(rand() % 16 + 50), verbose, bType))
+                if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, threadsafe_rand<ushort>(RAND_REG_RANGE_MIN, RAND_REG_RANGE_MAX), verbose, bType))
                     return false;
             }
             if (!addSrcRegistersForBranch(champsim_input_instr, srcCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
                 return false;
-            dstCount = 0;
-            if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addDstRegisterForBranch(champsim_input_instr, dstCount, REG_STACK_POINTER, verbose, bType))
                 return false;
             break;
         case TRACE_TYPE_INSTR_RETURN:
+            // Reads SP, not IP
+            // writes SP, IP
             if (!addSrcRegisterForBranch(champsim_input_instr, srcCount, REG_STACK_POINTER, verbose, bType))
                 return false;
-            dstCount = 0;
-            if (!addDstRegistersForBranch(champsim_input_instr, dstCount, {REG_STACK_POINTER, REG_INSTRUCTION_POINTER}, verbose, bType))
+            if (!addDstRegisterForBranch(champsim_input_instr, dstCount, REG_STACK_POINTER, verbose, bType))
                 return false;
             break;
         default:
@@ -302,8 +341,8 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, int &srcCount, int
 // update_inst_registers: Update input_instr registers for the given instruction.
 void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, input_instr &champsim_input_instr, bool verbose = false) {
     (void)(dcontext); // "use" it
-    int srcCount = 0;
-    int dstCount = 0;
+    unsigned srcCount = 0;
+    unsigned dstCount = 0;
     uint used_flag = instr_get_arith_flags(&dr_instr, DR_QUERY_DEFAULT);
 
     for (int i = 0; i < instr_num_srcs(&dr_instr); i++) {
@@ -342,6 +381,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
     } else {
         BranchType bType = getBranchType(record.instr.type);
         dstCount = 0;
+        // IP is always written on a branch
         if (!addDstRegisterForBranch(champsim_input_instr, dstCount, REG_INSTRUCTION_POINTER, verbose, bType)) {
             return;
         }
@@ -483,6 +523,7 @@ void simulate_core(thread_args &args) {
 
             // Now, convert DynamoRIO instruction into ChampSim instruction
             input_instr champsim_inst;
+            memset(&champsim_inst, 0, sizeof(champsim_inst)); // zero out all fields
             // There are four parts to a CS instruction:
             //  * ip
             //  * branch info
@@ -525,7 +566,7 @@ void simulate_core(thread_args &args) {
                     failure_counts[FAULT_DATA_PC_MISMATCH]++;
                 }
                 if (new_record.instr.type == TRACE_TYPE_READ) {
-                    if (inst_source_memory >= std::size(champsim_inst.source_memory)) {
+                    if (inst_source_memory >= MEM_SRC_NUM_INSTR) {
                         if (args.verbose) std::cerr << "Too many source memory" << std::endl;
                         failure_counts[FAULT_TOO_MANY_SRC_MEMORY]++;
                     } else {
@@ -534,7 +575,7 @@ void simulate_core(thread_args &args) {
                     assert(new_record.instr.addr != 0);
                 } else {
                     assert(new_record.instr.type == TRACE_TYPE_WRITE);
-                    if (inst_dest_memory >= std::size(champsim_inst.destination_memory)) {
+                    if (inst_dest_memory >= MEM_DST_NUM_INSTR) {
                         if (args.verbose) std::cerr << "Too many destination memory" << std::endl;
                         failure_counts[FAULT_TOO_MANY_DST_MEMORY]++;
                     } else {
