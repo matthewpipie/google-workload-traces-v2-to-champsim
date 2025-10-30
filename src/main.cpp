@@ -119,6 +119,8 @@ struct SimStats {
     uint64_t total_insts = 0;
     uint64_t branch_count = 0;
     std::array<uint64_t, BRANCH_MAX> branch_type_counts = {0,0,0,0,0,0,0,0,0}; // Indexed by BranchType 0..7.
+    ushort lowest_reg_id_seen = 65535;
+    ushort highest_reg_id_seen = 0;
 };
 
 #define TESTANY(mask, var) (((mask) & (var)) != 0)
@@ -338,9 +340,18 @@ bool assignBranchRegisters(input_instr &champsim_input_instr, unsigned &srcCount
     return true;
 }
 
+void update_reg_bounds(ushort reg, SimStats &stats) {
+    if (reg < stats.lowest_reg_id_seen) {
+        stats.lowest_reg_id_seen = reg;
+    }
+    if (reg > stats.highest_reg_id_seen) {
+        stats.highest_reg_id_seen = reg;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // update_inst_registers: Update input_instr registers for the given instruction.
-void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, input_instr &champsim_input_instr, bool verbose = false) {
+void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, input_instr &champsim_input_instr, SimStats &stats, bool verbose = false) {
     (void)(dcontext); // "use" it
     unsigned srcCount = 0;
     unsigned dstCount = 0;
@@ -350,6 +361,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
         opnd_t opnd = instr_get_src(&dr_instr, i);
         for (int opnum = 0; opnum < opnd_num_regs_used(opnd); opnum++) {
             reg_id_t reg = opnd_get_reg_used(opnd, opnum);
+            update_reg_bounds(reg, stats);
             if (verbose) {
                 std::cout << "src register " << i << "," << opnum << ": " << reg << std::endl;
             }
@@ -362,6 +374,7 @@ void update_inst_registers(void *dcontext, memref_t record, instr_t dr_instr, in
         opnd_t opnd = instr_get_dst(&dr_instr, i);
         for (int opnum = 0; opnum < opnd_num_regs_used(opnd); opnum++) {
             reg_id_t reg = opnd_get_reg_used(opnd, opnum);
+            update_reg_bounds(reg, stats);
             if (verbose) {
                 std::cout << "dst register " << i << "," << opnum << ": " << reg << std::endl;
             }
@@ -536,7 +549,7 @@ void simulate_core(thread_args &args) {
             //  * src, dest mems
             
             // Copy src, dest regs
-            update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, args.verbose);
+            update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, stats, args.verbose);
             
             // Copy ip
             champsim_inst.ip = record.instr.addr;
@@ -829,7 +842,8 @@ int main(int argc, char *argv[]) {
     }
     
     for (size_t i = 0; i < thread_stats.size(); i++) {
-        std::cout << "Thread " << i << " processed " << thread_stats[i].total_insts << " instructions\n";
+        std::cout << "Thread " << i << " processed " << thread_stats[i].total_insts
+        << " instructions, reg bounds = (" << thread_stats[i].lowest_reg_id_seen << "," << thread_stats[i].highest_reg_id_seen << ")\n";
     }
     
     std::cout << "\nTime taken: " << elapsed.count() << " seconds\n";
