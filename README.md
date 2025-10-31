@@ -46,6 +46,8 @@ If you want to convert threads to their own ChampSim thread-level trace, you cou
 
 We provide a script, `launch.py`, which converts all of the workloads in parallel according to `peak_live_core_count`. You can find it in `scripts/`. Edit the paths accordingly before running, and the target instruction count, defined at the top of the file.
 
+As a warning, converting 100M instructions in every workload in parallel (via launch.py) takes around 40 minutes on my powerful, 512 core machine. So 1 billion instructions might take a little while. And if your machine doesn't have a lot of cores, you might want to modify launch.py to use a threadpool instead of launching every thread.
+
 # Disclaimers and other notes
 
 Clang is not supported by DynamoRIO, you should run these tools on GNU Linux with g++, I've never tried them on anything else and they probably don't work.
