@@ -35,6 +35,8 @@
 #include "safe_num_cast.hpp"
 #include "threadsafe_rand.hpp"
 
+#define DECODE_CACHE_ENABLED (0) // Not confident in it right now.
+
 using namespace dynamorio::drmemtrace;
 using namespace champsim;
 
@@ -524,12 +526,15 @@ void simulate_core(thread_args &args) {
             // To make this faster, we cache known decodes in the map `pc_instr_map`
             size_t pc = record.instr.addr;
             auto it = pc_instr_map.find(pc);
+            // bool cache_hit;
             instr_t dr_instr;
-            if (it != pc_instr_map.end() && !record.instr.encoding_is_new) {
+            if (DECODE_CACHE_ENABLED && it != pc_instr_map.end() && !record.instr.encoding_is_new) {
                 // cache hit
+                // cache_hit = true;
                 dr_instr = it->second;
             } else {
                 // cache miss
+                // cache_hit = false;
                 // decode
                 instr_init(args.dcontext, &dr_instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
@@ -538,7 +543,9 @@ void simulate_core(thread_args &args) {
                 app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &dr_instr);
                 (void)(_nextpc);
                 // Write into decode cache
-                pc_instr_map[pc] = dr_instr;
+                if (DECODE_CACHE_ENABLED) {
+                    pc_instr_map[pc] = dr_instr;
+                }
             }
 
             // Now, convert DynamoRIO instruction into ChampSim instruction
@@ -609,6 +616,11 @@ void simulate_core(thread_args &args) {
             // Done, write out to gz file
             gzwrite(gz_out, &champsim_inst, sizeof(champsim_inst));
             record = new_record; // copy over the next record from the above code block
+            
+            // Free instr_t
+            if (!DECODE_CACHE_ENABLED) {
+                instr_free(args.dcontext, &dr_instr);
+            }
 
             // Break conditions
             if (args.instruction_cap_local != 0 && stats.total_insts >= args.instruction_cap_local) {
