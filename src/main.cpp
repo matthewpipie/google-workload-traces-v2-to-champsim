@@ -160,6 +160,8 @@ struct SimStats {
 // ChampSim assumes x86 has a limit of 4 input registers and 4 input memory addresses per instruction,
 // and a limit of 2 output registers and 2 output memory address per instruction.
 // However, the Google anonymization process seems to, for some reason, occasionally give instructions 5 inputs or 3 outputs.
+// According to Enrico, this happens because memory operands that use multiple registers (e.g. base and index) are considered to each be distinct sources here,
+//  regardless of whether or not the memory operand is a source or destination operand in the orginal instruction, because they will only be read.
 // In practice, this appears to be super rare (100,000 faults when processing billions of instructions), but it varies per workload,
 // so be sure to note it.
 

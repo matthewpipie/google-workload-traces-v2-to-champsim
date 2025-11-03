@@ -65,6 +65,7 @@ There are several sources of inaccuracies between the Google traces and the outp
 
 There are several sources of inaccuracies between ChampSim traces and ChampSim output:
 * ChampSim only supports single-threaded simulations. Although newer ChampSim supports multicore, these cores are assumed to not interfere / to belong to different processes. The Google cores all run code in the same multithreaded process. Thus, the single-threaded simulations do not accurately represent sharing behavior between cores, or contention that would be present in the shared microarchitecture (e.g. LLC, DRAM).
+* The Google traces come with a virtual to physical mapping which we currently don't use. Most pages are huge pages, though it may include some base pages. According to this [ChampSim issue](https://github.com/ChampSim/ChampSim/issues/382#issuecomment-2523679648), ChampSim is sensitive to the V2P mapping, but it currently determines this mapping at runtime by "faulting" unseen mappings and allocating a new physical page for them (without runtime cost more than the normal minor page fault cost). ChampSim is also incapable of adjusting page size per page, so you must choose one for the entire trace.
 * ChampSim isn't accurate in many ways.
 * More that I can't think of right now.
 

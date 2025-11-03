@@ -93,6 +93,8 @@ while processes:
         retcode = process.poll()
         if retcode is not None:  # Process has finished
             print(f"Process for trace '{trace}' finished with exit code {retcode}.")
+            if retcode != 0:
+                print(f"*** Check the log for more info! A crash has occured.")
             log_file.close()  # Close the log file for this process
             processes.remove((trace, process, log_file))
     time.sleep(0.5)  # Wait briefly before checking again
