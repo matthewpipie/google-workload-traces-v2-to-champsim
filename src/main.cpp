@@ -35,7 +35,13 @@
 #include "safe_num_cast.hpp"
 #include "threadsafe_rand.hpp"
 
-#define DECODE_CACHE_ENABLED (0) // Not confident in it right now.
+#define DECODE_CACHE_TYPE_NONE (0)
+#define DECODE_CACHE_TYPE_DR_INSTR_T (1)
+#define DECODE_CACHE_TYPE_CS_INSTR_T (2)
+
+#define DECODE_CACHE_TYPE DECODE_CACHE_TYPE_CS_INSTR_T
+
+#define CACHE_MEM_LIMIT_PERTHREAD (3lu * 1024lu * 1024lu * 1024lu)
 
 using namespace dynamorio::drmemtrace;
 using namespace champsim;
@@ -466,7 +472,8 @@ struct thread_args {
 // simulate_core: Processes records from a given stream.
 void simulate_core(thread_args &args) {
 
-    std::unordered_map<size_t, instr_t> pc_instr_map;
+    std::unordered_map<size_t, instr_t> dr_pc_instr_map;
+    std::unordered_map<size_t, input_instr> cs_pc_instr_map;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -525,17 +532,32 @@ void simulate_core(thread_args &args) {
             // We need to "decode" the instruction to get all of its operands, etc.
             // To make this faster, we cache known decodes in the map `pc_instr_map`
             size_t pc = record.instr.addr;
-            auto it = pc_instr_map.find(pc);
-            // bool cache_hit;
             instr_t dr_instr;
-            if (DECODE_CACHE_ENABLED && it != pc_instr_map.end() && !record.instr.encoding_is_new) {
-                // cache hit
-                // cache_hit = true;
-                dr_instr = it->second;
-            } else {
+            input_instr champsim_inst;
+            bool cache_hit;
+            if (DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_NONE || record.instr.encoding_is_new) {
+                cache_hit = false;
+            } else if (DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_DR_INSTR_T) {
+                // manage cache size
+                if (dr_pc_instr_map.size() * sizeof(instr_t) >= CACHE_MEM_LIMIT_PERTHREAD) {
+                    dr_pc_instr_map.clear(); // probably could do better lol
+                }
+                auto dr_it = dr_pc_instr_map.find(pc);
+                cache_hit = dr_it != dr_pc_instr_map.end();
+                if (cache_hit) dr_instr = dr_it->second;
+            } else if (DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_CS_INSTR_T) {
+                // manage cache size
+                if (cs_pc_instr_map.size() * sizeof(input_instr) >= CACHE_MEM_LIMIT_PERTHREAD) {
+                    cs_pc_instr_map.clear(); // probably could do better lol
+                }
+                auto cs_it = cs_pc_instr_map.find(pc);
+                cache_hit = cs_it != cs_pc_instr_map.end();
+                if (cache_hit) champsim_inst = cs_it->second;
+            }
+            if (!cache_hit) {
                 // cache miss
-                // cache_hit = false;
-                // decode
+                // write into dr_instr
+                // decode instruction and followup operands
                 instr_init(args.dcontext, &dr_instr);
                 const app_pc decode_pc = reinterpret_cast<app_pc>(pc);
                 // It's unclear if we need to use decode_from_copy() or if we can just use decode()
@@ -543,27 +565,37 @@ void simulate_core(thread_args &args) {
                 app_pc _nextpc = decode_from_copy(args.dcontext, record.instr.encoding, decode_pc, &dr_instr);
                 (void)(_nextpc);
                 // Write into decode cache
-                if (DECODE_CACHE_ENABLED) {
-                    pc_instr_map[pc] = dr_instr;
+                if (DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_DR_INSTR_T) {
+                    dr_pc_instr_map[pc] = dr_instr;
                 }
             }
 
-            // Now, convert DynamoRIO instruction into ChampSim instruction
-            input_instr champsim_inst;
-            memset(&champsim_inst, 0, sizeof(champsim_inst)); // zero out all fields
-            // There are four parts to a CS instruction:
-            //  * ip
-            //  * branch info
-            //  * src, dest regs
-            //  * src, dest mems
-            
-            // Copy src, dest regs
-            update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, stats, args.verbose);
-            
-            // Copy ip
-            champsim_inst.ip = record.instr.addr;
-            assert(champsim_inst.ip != 0);
-
+            bool skip_decode = cache_hit && DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_CS_INSTR_T;
+            if (!skip_decode) {
+                // Now, convert DynamoRIO instruction into ChampSim instruction
+                memset(&champsim_inst, 0, sizeof(champsim_inst)); // zero out all fields
+                // There are four parts to a CS instruction:
+                //  * ip
+                //  * branch info
+                //  * src, dest regs
+                //  * src, dest mems
+                
+                // Copy src, dest regs
+                // Note: stats aren't passed in here for cached instructions. Doesn't matter ATM since stats just track reg min,max
+                // However, cached instructions don't count again for failure_counts
+                update_inst_registers(args.dcontext, record, dr_instr, champsim_inst, stats, args.verbose);
+                
+                // Copy ip
+                champsim_inst.ip = record.instr.addr;
+                assert(champsim_inst.ip != 0);
+            } else {
+                // Decode skipped
+                // We are using an old champsim instruction that has already decoded register info
+                // However, this instance might have different memory operands, or different branch taken/non taken info
+                assert(champsim_inst.ip == pc);
+                memset(&champsim_inst.destination_memory, 0, sizeof(champsim_inst.destination_memory));
+                memset(&champsim_inst.source_memory, 0, sizeof(champsim_inst.source_memory));
+            }
             // Copy branch info
             update_branch_info(record, champsim_inst);
             if (champsim_inst.is_branch) {
@@ -600,8 +632,7 @@ void simulate_core(thread_args &args) {
                         champsim_inst.source_memory[inst_source_memory++] = new_record.instr.addr;
                     }
                     assert(new_record.instr.addr != 0);
-                } else {
-                    assert(new_record.instr.type == TRACE_TYPE_WRITE);
+                } else if (new_record.instr.type == TRACE_TYPE_WRITE) {
                     if (inst_dest_memory >= MEM_DST_NUM_INSTR) {
                         if (args.verbose) std::cerr << "Too many destination memory" << std::endl;
                         failure_counts[FAULT_TOO_MANY_DST_MEMORY]++;
@@ -613,12 +644,16 @@ void simulate_core(thread_args &args) {
                 status = stream->next_record(new_record);
             }
 
+            if (!cache_hit && DECODE_CACHE_TYPE == DECODE_CACHE_TYPE_CS_INSTR_T) {
+                cs_pc_instr_map[pc] = champsim_inst;
+            }
+
             // Done, write out to gz file
             gzwrite(gz_out, &champsim_inst, sizeof(champsim_inst));
             record = new_record; // copy over the next record from the above code block
             
             // Free instr_t
-            if (!DECODE_CACHE_ENABLED) {
+            if (!cache_hit && DECODE_CACHE_TYPE != DECODE_CACHE_TYPE_DR_INSTR_T) {
                 instr_free(args.dcontext, &dr_instr);
             }
 
