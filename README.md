@@ -9,6 +9,9 @@ You may find this command useful for recursively downloading all traces: https:/
 
 The traces are approximately 842GB.
 
+## Downloading Pre-converted Traces
+Pre-converted Google traces (for ChampSim) can be found here under gtrace\_v2: https://console.cloud.google.com/storage/browser/dpc4-all-traces .
+
 ## Building the Converter
 
 First, build DynamoRIO:
@@ -81,7 +84,7 @@ If you want to do multicore simulations, read the above statements carefully. Ch
 
 The expected output IPC is low: less than 1 on every workload except `arizona`. Good luck. 
 
-## Things I am not confident in
+## Things I am not confident in (now confirmed OK by Google folks)
 
 * main.cpp:520-540  Is this the right way to "decode" the instruction?
 * Are the flags extracted from DynamoRIO trustworthy or obfuscated? We rely on them being trustworthy, given that we never generate FLAGS dependencies (except for branches) since it's a "magic" register.
